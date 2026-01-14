@@ -1,151 +1,82 @@
 pipeline {
-    agent any
-    stages {
-        stage('Login to ECR') {
-            steps {
-                withCredentials([string(credentialsId: 'aws-secret', variable: 'AWS_SECRET')]) {
-                    sh 'aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin $AWS_SECRET' 
-    agent none
-    options {
-        skipDefaultCheckout() // נמנע מ-checkout אוטומטי של git כדי לשלוט בזה בעצמנו
-        timestamps()
-    }
+    agent any // מאפשר לג'נקינס להריץ את ה-Pipeline
 
     environment {
-        // שם התמונה ב-ECR, ניתן לשנות כפרמטר
-        IMAGE_NAME = 'my-app'
-        // Branch-specific tag: PR number או commit hash
-        IMAGE_TAG = "${env.BRANCH_NAME}-${env.BUILD_NUMBER}"
-        // שם פרודקשן host (Parameterizable)
-        PROD_HOST = credentials('prod-host-ssh') // Jenkins credential מסוג SSH username/private key
-        AWS_CREDENTIALS = 'aws-ecr-creds'        // Jenkins AWS Credentials ID
-        ECR_REPO = '123456789012.dkr.ecr.us-east-1.amazonaws.com/my-app'
+        // --- שנה את הפרטים האלו לפי ה-AWS שלך ---
+        AWS_ACCOUNT_ID = "123456789012" 
+        AWS_REGION     = "us-east-1"
+        ECR_REPO       = "calculator-app"
+        ECR_URL        = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}"
+        
+        // יצירת תגית לפי דרישת המבחן: pr-<id>-build-<number> או latest למאסטר
+        IMAGE_TAG = env.CHANGE_ID ? "pr-${env.CHANGE_ID}-build-${env.BUILD_NUMBER}" : "latest"
     }
 
     stages {
-
-        stage('Checkout') {
-            agent { docker { image 'alpine/git' } }
+        // שלב 1: בנייה (חלק מ-Part C ו-D)
+        stage('Build Image') {
             steps {
-                checkout scm
+                script {
+                    sh "docker build -t ${ECR_URL}:${IMAGE_TAG} ."
+                }
             }
         }
 
-        stage('CI/CD') {
-            parallel {
-
-                stage('CI Flow (PR)') {
-                    when { expression { !env.BRANCH_NAME.equals('main') } }
-                    agent { docker { image 'docker:24-dind' 
-                                     args '-v /var/run/docker.sock:/var/run/docker.sock' } }
-                    stages {
-                        stage('Build Docker Image') {
-                            steps {
-                                sh """
-                                docker build -t ${IMAGE_NAME}:${IMAGE_TAG} .
-                                """
-                            }
-                        }
-
-                        stage('Run Tests') {
-                            agent { docker { image "${IMAGE_NAME}:${IMAGE_TAG}" } }
-                            steps {
-                                sh 'pytest tests/' // או פקודת בדיקות מתאימה לשפה שלך
-                            }
-                        }
-
-                        stage('Push to ECR') {
-                            environment {
-                                AWS_DEFAULT_REGION = 'us-east-1'
-                            }
-                            steps {
-                                withAWS(credentials: "${AWS_CREDENTIALS}", region: 'us-east-1') {
-                                    sh """
-                                    aws ecr get-login-password --region us-east-1 | \
-                                    docker login --username AWS --password-stdin ${ECR_REPO}
-                                    docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${ECR_REPO}:${IMAGE_TAG}
-                                    docker push ${ECR_REPO}:${IMAGE_TAG}
-                                    """
-                                }
-                            }
-                        }
-                    }
+        // שלב 2: טסטים - חייב לרוץ בתוך Docker Agent לפי המבחן!
+        stage('Test') {
+            agent {
+                docker { 
+                    image 'python:3.9-slim' 
+                    // מחבר את התיקייה הנוכחית לקונטיינר
                 }
+            }
+            steps {
+                sh 'pip install -r requirements.txt'
+                sh 'pytest tests/' 
+            }
+        }
 
-                stage('CD Flow (Main)') {
-                    when { branch 'main' }
-                    agent { docker { image 'docker:24-dind' 
-                                     args '-v /var/run/docker.sock:/var/run/docker.sock' } }
-                    stages {
-                        stage('Build Docker Image') {
-                            steps {
-                                sh "docker build -t ${IMAGE_NAME}:${IMAGE_TAG} ."
-                            }
-                        }
-
-                        stage('Run Tests') {
-                            agent { docker { image "${IMAGE_NAME}:${IMAGE_TAG}" } }
-                            steps {
-                                sh 'pytest tests/'
-                            }
-                        }
-
-                        stage('Push to ECR') {
-                            steps {
-                                withAWS(credentials: "${AWS_CREDENTIALS}", region: 'us-east-1') {
-                                    sh """
-                                    aws ecr get-login-password --region us-east-1 | \
-                                    docker login --username AWS --password-stdin ${ECR_REPO}
-                                    docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${ECR_REPO}:${IMAGE_TAG}
-                                    docker push ${ECR_REPO}:${IMAGE_TAG}
-                                    """
-                                }
-                            }
-                        }
-
-                        stage('Deploy to Production') {
-                            steps {
-                                sshagent (credentials: ['prod-host-ssh']) {
-                                    sh """
-                                    ssh -o StrictHostKeyChecking=no ec2-user@${PROD_HOST} \\
-                                    'docker pull ${ECR_REPO}:${IMAGE_TAG} && \\
-                                     docker stop my-app || true && \\
-                                     docker rm my-app || true && \\
-                                     docker run -d --name my-app -p 80:80 ${ECR_REPO}:${IMAGE_TAG}'
-                                    """
-                                }
-                            }
-                        }
-
-                        stage('Health Check') {
-                            steps {
-                                sh """
-                                STATUS=\$(curl -s -o /dev/null -w "%{http_code}" http://${PROD_HOST})
-                                if [ "\$STATUS" -ne 200 ]; then
-                                  echo "Health check failed"
-                                  exit 1
-                                else
-                                  echo "Deployment successful"
-                                fi
-                                """
-                            }
-                        }
-                    }
- 6cda1ae (this henkins)
+        // שלב 3: דחיפה ל-ECR (חלק מ-Part C ו-D)
+        stage('Push to ECR') {
+            steps {
+                script {
+                    // התחברות ל-ECR בעזרת ה-Instance Role (הכי פשוט במבחן)
+                    sh "aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_URL}"
+                    sh "docker push ${ECR_URL}:${IMAGE_TAG}"
                 }
+            }
+        }
+
+        // שלב 4: פריסה - רק כשעושים Merge למאסטר (Part D)
+        stage('Deploy to Production') {
+            when {
+                branch 'master'
+            }
+            steps {
+                // התחברות לשרת הפרודקשן (צריך להחליף ל-IP האמיתי)
+                // כאן כדאי להשתמש ב-Credentials ששמרת בג'נקינס
+                sh 'echo "Deploying to Production EC2..."'
+                /* דוגמה לפקודה (אם הגדרת SSH):
+                sh "ssh -o StrictHostKeyChecking=no ec2-user@PROD_IP 'docker pull ${ECR_URL}:${IMAGE_TAG} && docker run -d -p 80:5000 ${ECR_URL}:${IMAGE_TAG}'"
+                */
+            }
+        }
+
+        // שלב 5: בדיקת תקינות (Health Verification - Part D)
+        stage('Health Check') {
+            when {
+                branch 'master'
+            }
+            steps {
+                sh 'sleep 10' // מחכים רגע שהאפליקציה תעלה
+                sh 'curl -f http://44.223.6.17:PORT/health || exit 1'
             }
         }
     }
+
     post {
         always {
-            cleanWs()
-        }
-        success {
-            echo "Pipeline completed successfully!"
-        }
-        failure {
-            echo "Pipeline failed!"
+            cleanWs() // מנקה את מרחב העבודה בסוף
         }
     }
- 6cda1ae (this henkins)
 }
